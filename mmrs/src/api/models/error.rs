@@ -54,6 +54,15 @@ pub enum ModemError {
     #[error("modem not found: {0}")]
     ModemNotFound(String),
 
+    /// A supplied string was not a valid D-Bus object path.
+    #[error("invalid D-Bus object path `{path}`: {reason}")]
+    InvalidObjectPath {
+        /// The path that failed validation.
+        path: String,
+        /// Why the path is invalid.
+        reason: String,
+    },
+
     /// The modem is in the failed state and cannot be used.
     #[error("modem in failed state: {0}")]
     ModemFailed(String),

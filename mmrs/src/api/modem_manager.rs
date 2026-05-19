@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
+use futures::future::try_join_all;
 use zbus::Connection;
 use zvariant::{OwnedObjectPath, OwnedValue, Str, Value};
 
@@ -16,6 +17,17 @@ use crate::dbus::{MMBearerProxy, MMManagerProxy, MMModemProxy, MMModemSimpleProx
 const MODEM_MANAGER_SERVICE: &str = "org.freedesktop.ModemManager1";
 const MODEM_MANAGER_PATH: &str = "/org/freedesktop/ModemManager1";
 const MODEM_INTERFACE: &str = "org.freedesktop.ModemManager1.Modem";
+
+const MM_INCORRECT_PASSWORD: &str =
+    "org.freedesktop.ModemManager1.Error.MobileEquipment.IncorrectPassword";
+const MM_INCORRECT_PIN: &str = "org.freedesktop.ModemManager1.Error.MobileEquipment.IncorrectPin";
+const MM_INCORRECT_PUK: &str = "org.freedesktop.ModemManager1.Error.MobileEquipment.IncorrectPuk";
+
+/// Bearer IP configuration method constants (`MM_BEARER_IP_METHOD_*`).
+const MM_BEARER_IP_METHOD_UNKNOWN: u32 = 0;
+const MM_BEARER_IP_METHOD_PPP: u32 = 1;
+const MM_BEARER_IP_METHOD_STATIC: u32 = 2;
+const MM_BEARER_IP_METHOD_DHCP: u32 = 3;
 
 /// High-level interface to ModemManager over D-Bus.
 ///
@@ -34,8 +46,13 @@ impl ModemManager {
     }
 
     /// Creates a [`ModemManager`] from an existing D-Bus connection.
+    ///
+    /// Validates that ModemManager is reachable on the bus by reading its
+    /// version property. Returns an error immediately if the service is not
+    /// running.
     pub async fn with_connection(conn: Connection) -> Result<Self> {
-        MMManagerProxy::new(&conn).await?;
+        let proxy = MMManagerProxy::new(&conn).await?;
+        let _ = proxy.version().await?;
         Ok(Self { conn })
     }
 
@@ -47,31 +64,37 @@ impl ModemManager {
     /// Lists all modems currently managed by ModemManager.
     pub async fn list_modems(&self) -> Result<Vec<Modem>> {
         let paths = enumerate_modem_paths(&self.conn).await?;
-        let mut modems = Vec::with_capacity(paths.len());
-
-        for path in paths {
-            modems.push(self.modem_info_for_path(path.as_str()).await?);
-        }
-
-        Ok(modems)
+        let futures: Vec<_> = paths
+            .iter()
+            .map(|path| self.modem_info_for_path(path.as_str()))
+            .collect();
+        try_join_all(futures).await
     }
 
     /// Returns the modem whose equipment identifier matches the given IMEI.
+    ///
+    /// Only reads the `EquipmentIdentifier` property from each modem path
+    /// and fetches the full snapshot once a match is found, avoiding
+    /// unnecessary D-Bus round-trips on multi-modem systems.
     pub async fn modem_by_imei(&self, imei: &str) -> Result<Modem> {
-        self.list_modems()
-            .await?
-            .into_iter()
-            .find(|modem| modem.equipment_identifier == imei)
-            .ok_or_else(|| ModemError::ModemNotFound(format!("IMEI {imei}")))
+        let paths = enumerate_modem_paths(&self.conn).await?;
+        for path in &paths {
+            let proxy = modem_proxy(&self.conn, path).await?;
+            if proxy.equipment_identifier().await? == imei {
+                return self.modem_info_for_path(path).await;
+            }
+        }
+        Err(ModemError::ModemNotFound(format!("IMEI {imei}")))
     }
 
-    /// Returns the first modem reported by ModemManager.
+    /// Returns the modem with the lowest-sorted object path.
+    ///
+    /// On single-modem systems this is the only modem. On multi-modem
+    /// systems this is the modem whose path sorts first numerically by
+    /// trailing index.
     pub async fn primary_modem(&self) -> Result<Modem> {
-        let mut modems = self.list_modems().await?;
-        if modems.is_empty() {
-            return Err(ModemError::NoModems);
-        }
-        Ok(modems.remove(0))
+        let path = self.primary_modem_path().await?;
+        self.modem_info_for_path(&path).await
     }
 
     /// Creates a scope for operating on a specific modem object path.
@@ -168,7 +191,8 @@ impl ModemManager {
             .build()
             .await?;
 
-        let (signal_quality, _) = proxy.signal_quality().await?;
+        let (signal_quality, recent) = proxy.signal_quality().await?;
+        let signal_quality = if recent { signal_quality } else { 0 };
         let sim_path = proxy.sim().await?;
         let bearer_paths = proxy
             .bearers()
@@ -243,7 +267,7 @@ impl ModemManager {
             .or_else(|| take_u32(&status, "access-technologies"))
             .map(AccessTechnology::from)
             .unwrap_or(modem.access_technologies);
-        let signal_quality = take_u32(&status, "signal-quality").or(Some(modem.signal_quality));
+        let signal_quality = take_u32(&status, "signal-quality");
 
         Ok(ConnectionStatus {
             modem_path: modem.path,
@@ -278,13 +302,7 @@ impl ModemManager {
 
     pub(crate) async fn unlock_pin_for_path(&self, path: &str, pin: &str) -> Result<()> {
         let sim = sim_proxy_for_modem(&self.conn, path).await?;
-        sim.send_pin(pin).await.map_err(|e| {
-            if is_wrong_pin_error(&e) {
-                ModemError::WrongPin
-            } else {
-                ModemError::Dbus(e)
-            }
-        })
+        sim.send_pin(pin).await.map_err(classify_pin_error)
     }
 
     pub(crate) async fn unlock_puk_for_path(
@@ -294,13 +312,7 @@ impl ModemManager {
         new_pin: &str,
     ) -> Result<()> {
         let sim = sim_proxy_for_modem(&self.conn, path).await?;
-        sim.send_puk(puk, new_pin).await.map_err(|e| {
-            if is_wrong_puk_error(&e) {
-                ModemError::WrongPuk
-            } else {
-                ModemError::Dbus(e)
-            }
-        })
+        sim.send_puk(puk, new_pin).await.map_err(classify_pin_error)
     }
 
     pub(crate) async fn set_pin_enabled_for_path(
@@ -310,24 +322,14 @@ impl ModemManager {
         enabled: bool,
     ) -> Result<()> {
         let sim = sim_proxy_for_modem(&self.conn, path).await?;
-        sim.enable_pin(pin, enabled).await.map_err(|e| {
-            if is_wrong_pin_error(&e) {
-                ModemError::WrongPin
-            } else {
-                ModemError::Dbus(e)
-            }
-        })
+        sim.enable_pin(pin, enabled)
+            .await
+            .map_err(classify_pin_error)
     }
 
     pub(crate) async fn change_pin_for_path(&self, path: &str, old: &str, new: &str) -> Result<()> {
         let sim = sim_proxy_for_modem(&self.conn, path).await?;
-        sim.change_pin(old, new).await.map_err(|e| {
-            if is_wrong_pin_error(&e) {
-                ModemError::WrongPin
-            } else {
-                ModemError::Dbus(e)
-            }
-        })
+        sim.change_pin(old, new).await.map_err(classify_pin_error)
     }
 
     pub(crate) async fn signal_quality_for_path(&self, path: &str) -> Result<u32> {
@@ -363,8 +365,19 @@ async fn enumerate_modem_paths(conn: &Connection) -> Result<Vec<String>> {
         .filter(|(_, ifaces)| ifaces.contains_key(MODEM_INTERFACE))
         .map(|(path, _)| path.to_string())
         .collect();
-    paths.sort();
+    paths.sort_by(|a, b| numeric_path_cmp(a, b));
     Ok(paths)
+}
+
+/// Compare two D-Bus object paths by trailing numeric index so that
+/// `.../Modem/2` sorts before `.../Modem/10`.
+fn numeric_path_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let trailing_num =
+        |s: &str| -> Option<u64> { s.rsplit('/').next().and_then(|seg| seg.parse().ok()) };
+    match (trailing_num(a), trailing_num(b)) {
+        (Some(na), Some(nb)) => na.cmp(&nb),
+        _ => a.cmp(b),
+    }
 }
 
 async fn modem_proxy<'a>(conn: &'a Connection, path: &str) -> Result<MMModemProxy<'a>> {
@@ -428,8 +441,10 @@ fn bearer_properties(config: &BearerConfig) -> HashMap<&str, Value<'_>> {
 }
 
 fn modem_object_path(path: &str) -> Result<OwnedObjectPath> {
-    OwnedObjectPath::try_from(path)
-        .map_err(|e| ModemError::ModemNotFound(format!("{path} (invalid D-Bus object path: {e})")))
+    OwnedObjectPath::try_from(path).map_err(|e| ModemError::InvalidObjectPath {
+        path: path.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 fn object_path_option(path: &OwnedObjectPath) -> Option<String> {
@@ -442,16 +457,33 @@ fn decode_ip4_config(values: &HashMap<String, OwnedValue>) -> Option<Ip4Config> 
         return None;
     }
 
+    let method =
+        take_str(values, "method").or_else(|| take_u32(values, "method").and_then(ip_method_name));
+
+    let address = take_str(values, "address").and_then(|value| value.parse().ok());
+
+    if method.is_none() && address.is_none() {
+        return None;
+    }
+
     Some(Ip4Config {
-        method: take_str(values, "method")
-            .or_else(|| take_u32(values, "method").map(|value| value.to_string()))
-            .unwrap_or_default(),
-        address: take_str(values, "address").and_then(|value| value.parse().ok()),
+        method: method.unwrap_or_default(),
+        address,
         prefix: take_u32(values, "prefix").unwrap_or_default(),
         gateway: take_str(values, "gateway").and_then(|value| value.parse().ok()),
         dns: take_ipv4_vec(values, "dns"),
         mtu: take_u32(values, "mtu"),
     })
+}
+
+fn ip_method_name(raw: u32) -> Option<String> {
+    match raw {
+        MM_BEARER_IP_METHOD_UNKNOWN => None,
+        MM_BEARER_IP_METHOD_PPP => Some("ppp".to_string()),
+        MM_BEARER_IP_METHOD_STATIC => Some("static".to_string()),
+        MM_BEARER_IP_METHOD_DHCP => Some("dhcp".to_string()),
+        _ => None,
+    }
 }
 
 fn decode_bearer_stats(values: &HashMap<String, OwnedValue>) -> BearerStats {
@@ -531,12 +563,291 @@ fn owned_to_u64(value: &OwnedValue) -> Option<u64> {
         .or_else(|| u32::try_from(value.clone()).ok().map(u64::from))
 }
 
-fn is_wrong_pin_error(error: &zbus::Error) -> bool {
-    let rendered = error.to_string().to_ascii_lowercase();
-    rendered.contains("wrong") && rendered.contains("pin")
+/// Classify a zbus error from a SIM PIN/PUK operation into the
+/// appropriate [`ModemError`] variant by inspecting the structured
+/// D-Bus error name rather than the (locale-dependent) human-readable
+/// message.
+fn classify_pin_error(error: zbus::Error) -> ModemError {
+    let name = dbus_error_name(&error);
+    if name.as_deref() == Some(MM_INCORRECT_PIN) || name.as_deref() == Some(MM_INCORRECT_PASSWORD) {
+        return ModemError::WrongPin;
+    }
+    if name.as_deref() == Some(MM_INCORRECT_PUK) {
+        return ModemError::WrongPuk;
+    }
+    ModemError::Dbus(error)
 }
 
-fn is_wrong_puk_error(error: &zbus::Error) -> bool {
-    let rendered = error.to_string().to_ascii_lowercase();
-    rendered.contains("wrong") && rendered.contains("puk")
+fn dbus_error_name(error: &zbus::Error) -> Option<String> {
+    match error {
+        zbus::Error::MethodError(name, _, _) => Some(name.to_string()),
+        zbus::Error::FDO(boxed) => {
+            use zbus::fdo::Error as FdoError;
+            match boxed.as_ref() {
+                FdoError::ZBus(inner) => dbus_error_name(inner),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_map(pairs: &[(&str, OwnedValue)]) -> HashMap<String, OwnedValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    fn str_val(s: &str) -> OwnedValue {
+        Value::from(s).try_into().unwrap()
+    }
+
+    fn u32_val(n: u32) -> OwnedValue {
+        Value::from(n).try_into().unwrap()
+    }
+
+    fn i32_val(n: i32) -> OwnedValue {
+        Value::from(n).try_into().unwrap()
+    }
+
+    fn u64_val(n: u64) -> OwnedValue {
+        Value::from(n).try_into().unwrap()
+    }
+
+    // --- take_* helpers ---
+
+    #[test]
+    fn take_str_returns_string_value() {
+        let map = make_map(&[("method", str_val("ppp"))]);
+        assert_eq!(take_str(&map, "method"), Some("ppp".to_string()));
+    }
+
+    #[test]
+    fn take_str_returns_none_for_missing_key() {
+        let map: HashMap<String, OwnedValue> = HashMap::new();
+        assert_eq!(take_str(&map, "method"), None);
+    }
+
+    #[test]
+    fn take_u32_from_u32_value() {
+        let map = make_map(&[("prefix", u32_val(24))]);
+        assert_eq!(take_u32(&map, "prefix"), Some(24));
+    }
+
+    #[test]
+    fn take_u32_from_i32_value() {
+        let map = make_map(&[("prefix", i32_val(24))]);
+        assert_eq!(take_u32(&map, "prefix"), Some(24));
+    }
+
+    #[test]
+    fn take_u32_returns_none_for_missing() {
+        let map: HashMap<String, OwnedValue> = HashMap::new();
+        assert_eq!(take_u32(&map, "prefix"), None);
+    }
+
+    #[test]
+    fn take_i32_from_i32_value() {
+        let map = make_map(&[("state", i32_val(-1))]);
+        assert_eq!(take_i32(&map, "state"), Some(-1));
+    }
+
+    #[test]
+    fn take_u64_from_u64_value() {
+        let map = make_map(&[("rx-bytes", u64_val(123456))]);
+        assert_eq!(take_u64(&map, "rx-bytes"), Some(123456));
+    }
+
+    #[test]
+    fn take_u64_from_u32_value() {
+        let map = make_map(&[("rx-bytes", u32_val(42))]);
+        assert_eq!(take_u64(&map, "rx-bytes"), Some(42));
+    }
+
+    // --- object_path_option ---
+
+    #[test]
+    fn object_path_option_root_is_none() {
+        let path = OwnedObjectPath::try_from("/").unwrap();
+        assert!(object_path_option(&path).is_none());
+    }
+
+    #[test]
+    fn object_path_option_real_path_is_some() {
+        let path = OwnedObjectPath::try_from("/org/freedesktop/ModemManager1/SIM/0").unwrap();
+        assert_eq!(
+            object_path_option(&path),
+            Some("/org/freedesktop/ModemManager1/SIM/0".to_string())
+        );
+    }
+
+    // --- modem_object_path ---
+
+    #[test]
+    fn modem_object_path_valid() {
+        let path = modem_object_path("/org/freedesktop/ModemManager1/Modem/0");
+        assert!(path.is_ok());
+    }
+
+    #[test]
+    fn modem_object_path_invalid_returns_invalid_object_path() {
+        let err = modem_object_path("not a path").unwrap_err();
+        assert!(
+            matches!(err, ModemError::InvalidObjectPath { .. }),
+            "expected InvalidObjectPath, got {err:?}"
+        );
+    }
+
+    // --- ip_method_name ---
+
+    #[test]
+    fn ip_method_name_known_values() {
+        assert_eq!(ip_method_name(0), None);
+        assert_eq!(ip_method_name(1), Some("ppp".to_string()));
+        assert_eq!(ip_method_name(2), Some("static".to_string()));
+        assert_eq!(ip_method_name(3), Some("dhcp".to_string()));
+        assert_eq!(ip_method_name(99), None);
+    }
+
+    // --- decode_ip4_config ---
+
+    #[test]
+    fn decode_ip4_config_empty_map_returns_none() {
+        let map = HashMap::new();
+        assert!(decode_ip4_config(&map).is_none());
+    }
+
+    #[test]
+    fn decode_ip4_config_no_method_or_address_returns_none() {
+        let map = make_map(&[("mtu", u32_val(1500))]);
+        assert!(decode_ip4_config(&map).is_none());
+    }
+
+    #[test]
+    fn decode_ip4_config_unknown_numeric_method_no_address_returns_none() {
+        let map = make_map(&[("method", u32_val(0))]);
+        assert!(decode_ip4_config(&map).is_none());
+    }
+
+    #[test]
+    fn decode_ip4_config_string_method() {
+        let map = make_map(&[
+            ("method", str_val("static")),
+            ("address", str_val("10.0.0.1")),
+            ("prefix", u32_val(24)),
+        ]);
+        let cfg = decode_ip4_config(&map).unwrap();
+        assert_eq!(cfg.method, "static");
+        assert_eq!(cfg.address, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(cfg.prefix, 24);
+    }
+
+    #[test]
+    fn decode_ip4_config_numeric_method() {
+        let map = make_map(&[("method", u32_val(1))]);
+        let cfg = decode_ip4_config(&map).unwrap();
+        assert_eq!(cfg.method, "ppp");
+    }
+
+    #[test]
+    fn decode_ip4_config_address_only() {
+        let map = make_map(&[("address", str_val("192.168.1.1"))]);
+        let cfg = decode_ip4_config(&map).unwrap();
+        assert_eq!(cfg.address, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(cfg.method.is_empty());
+    }
+
+    // --- decode_bearer_stats ---
+
+    #[test]
+    fn decode_bearer_stats_empty_map_is_zeroed() {
+        let stats = decode_bearer_stats(&HashMap::new());
+        assert_eq!(stats.rx_bytes, 0);
+        assert_eq!(stats.tx_bytes, 0);
+        assert_eq!(stats.duration_seconds, 0);
+    }
+
+    #[test]
+    fn decode_bearer_stats_populates_fields() {
+        let map = make_map(&[
+            ("rx-bytes", u64_val(1000)),
+            ("tx-bytes", u64_val(2000)),
+            ("duration", u32_val(60)),
+            ("attempts", u32_val(3)),
+            ("failed-attempts", u32_val(1)),
+        ]);
+        let stats = decode_bearer_stats(&map);
+        assert_eq!(stats.rx_bytes, 1000);
+        assert_eq!(stats.tx_bytes, 2000);
+        assert_eq!(stats.duration_seconds, 60);
+        assert_eq!(stats.attempts, 3);
+        assert_eq!(stats.failed_attempts, 1);
+    }
+
+    // --- classify_pin_error ---
+
+    fn make_method_error(name: &str) -> zbus::Error {
+        use zbus::message::Message;
+        let call = Message::method_call("/", "Foo")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let reply = Message::error(&call.header(), name)
+            .unwrap()
+            .build(&"error detail")
+            .unwrap();
+        reply.into()
+    }
+
+    #[test]
+    fn classify_pin_error_incorrect_pin() {
+        let error = make_method_error(MM_INCORRECT_PIN);
+        assert!(matches!(classify_pin_error(error), ModemError::WrongPin));
+    }
+
+    #[test]
+    fn classify_pin_error_incorrect_password() {
+        let error = make_method_error(MM_INCORRECT_PASSWORD);
+        assert!(matches!(classify_pin_error(error), ModemError::WrongPin));
+    }
+
+    #[test]
+    fn classify_pin_error_incorrect_puk() {
+        let error = make_method_error(MM_INCORRECT_PUK);
+        assert!(matches!(classify_pin_error(error), ModemError::WrongPuk));
+    }
+
+    #[test]
+    fn classify_pin_error_other_falls_through() {
+        let error = zbus::Error::InvalidReply;
+        assert!(matches!(classify_pin_error(error), ModemError::Dbus(_)));
+    }
+
+    // --- numeric_path_cmp ---
+
+    #[test]
+    fn numeric_sort_orders_correctly() {
+        let mut paths = [
+            "/org/freedesktop/ModemManager1/Modem/10".to_string(),
+            "/org/freedesktop/ModemManager1/Modem/2".to_string(),
+            "/org/freedesktop/ModemManager1/Modem/1".to_string(),
+        ];
+        paths.sort_by(|a, b| numeric_path_cmp(a, b));
+        assert_eq!(paths[0], "/org/freedesktop/ModemManager1/Modem/1");
+        assert_eq!(paths[1], "/org/freedesktop/ModemManager1/Modem/2");
+        assert_eq!(paths[2], "/org/freedesktop/ModemManager1/Modem/10");
+    }
+
+    #[test]
+    fn numeric_sort_falls_back_to_lexicographic() {
+        let mut paths = ["b/xyz".to_string(), "a/abc".to_string()];
+        paths.sort_by(|a, b| numeric_path_cmp(a, b));
+        assert_eq!(paths[0], "a/abc");
+        assert_eq!(paths[1], "b/xyz");
+    }
 }
