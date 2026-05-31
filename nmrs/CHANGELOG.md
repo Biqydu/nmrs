@@ -3,9 +3,20 @@
 All notable changes to the `nmrs` crate will be documented in this file.
 
 ## [Unreleased]
+
+## [3.2.0] - 2026-05-31
+### Added
+- Add EAP-TLS support for WPA-Enterprise Wi-Fi, including TLS certificate/key path or blob configuration on `EapOptions` and `EapMethod::Tls` ([#434](https://github.com/networkmanager-rs/nmrs/pull/434))
+- Add WPA3-Enterprise 192-bit Wi-Fi support via `WifiSecurity::Wpa3Eap192bit` and `WifiConnectionBuilder::wpa3_eap_192_bit()` ([#434](https://github.com/networkmanager-rs/nmrs/pull/434))
+- Add race-free `try_connect` and `try_connect_to_bssid` APIs for `NetworkManager` and `WifiScope`, plus `ConnectionError::ConnectionInProgress` ([#427](https://github.com/networkmanager-rs/nmrs/pull/427))
+
+### Changed
+- Send EAP certificate and private-key file paths to NetworkManager as NUL-terminated byte arrays, matching NetworkManager's D-Bus settings format ([#434](https://github.com/networkmanager-rs/nmrs/pull/434))
+
 ### Fixed
 - Guard connect operations with async mutex to prevent TOCTOU race between `is_connecting()` and `connect()` ([#427](https://github.com/networkmanager-rs/nmrs/pull/427))
-- Switches saved connection lookup to use `validate_connection_name()` instead of `validate_ssid()`. Using the latter causes VPN profile names longer than 32-bytes to pass through. ([#426](https://github.com/networkmanager-rs/nmrs/pull/426))
+- Make `EapOptionsBuilder::build()` reject EAP-TLS configs missing a private key or client certificate ([#436](https://github.com/networkmanager-rs/nmrs/pull/436))
+- Switch saved connection lookup to use `validate_connection_name()` instead of `validate_ssid()`, allowing VPN profile names longer than Wi-Fi SSIDs ([#426](https://github.com/networkmanager-rs/nmrs/pull/426))
 
 ## [3.1.5] - 2026-05-20
 ### Fixed
@@ -300,7 +311,8 @@ All notable changes to the `nmrs` crate will be documented in this file.
 [3.1.3]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.1.3
 [3.1.4]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.1.4
 [3.1.5]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.1.5
-[Unreleased]: https://github.com/cachebag/nmrs/compare/nmrs-v3.1.5...HEAD
+[3.2.0]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.2.0
+[Unreleased]: https://github.com/cachebag/nmrs/compare/nmrs-v3.2.0...HEAD
 [1.1.0]: https://github.com/cachebag/nmrs/compare/nmrs-v1.0.1...nmrs-v1.1.0
 [1.0.1]: https://github.com/cachebag/nmrs/compare/nmrs-v1.0.0...nmrs-v1.0.1
 [1.0.0]: https://github.com/cachebag/nmrs/compare/v0.5.0-beta...nmrs-v1.0.0
