@@ -3,6 +3,8 @@
 All notable changes to the `nmrs` crate will be documented in this file.
 
 ## [Unreleased]
+
+## [3.2.2] - 2026-06-30
 ### Fixed
 - `SecretAgent` now registers without owning a policy-controlled system bus
   name and serves the standard NetworkManager secret-agent object path, so
@@ -398,7 +400,8 @@ present)` constructor; `RadioState::new` keeps existing behavior and defaults
 [3.1.5]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.1.5
 [3.2.0]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.2.0
 [3.2.1]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.2.1
-[Unreleased]: https://github.com/cachebag/nmrs/compare/nmrs-v3.2.1...HEAD
+[3.2.2]: https://github.com/cachebag/nmrs/compare/nmrs-v1.2.0...nmrs-v3.2.2
+[Unreleased]: https://github.com/cachebag/nmrs/compare/nmrs-v3.2.2...HEAD
 [1.1.0]: https://github.com/cachebag/nmrs/compare/nmrs-v1.0.1...nmrs-v1.1.0
 [1.0.1]: https://github.com/cachebag/nmrs/compare/nmrs-v1.0.0...nmrs-v1.0.1
 [1.0.0]: https://github.com/cachebag/nmrs/compare/v0.5.0-beta...nmrs-v1.0.0
