@@ -310,6 +310,16 @@ mod util;
 /// lifecycle, and a full example.
 pub mod agent;
 
+/// Low-level D-Bus dependencies used by [`builders`](crate::builders).
+///
+/// Re-exports [`zbus`] and [`zvariant`] so advanced callers can construct
+/// proxies against [`NetworkManager::dbus_connection`](crate::NetworkManager::dbus_connection)
+/// without pinning their own potentially incompatible versions.
+pub mod raw {
+    pub use zbus;
+    pub use zvariant;
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -334,7 +344,8 @@ pub mod agent;
 /// and [`connect_vpn`](crate::NetworkManager::connect_vpn). Use these
 /// builders only when you need to feed a raw settings dictionary to
 /// NetworkManager's `AddConnection` or `AddAndActivateConnection` D-Bus
-/// methods directly.
+/// methods directly via [`dbus_connection`](crate::NetworkManager::dbus_connection)
+/// and [`raw`](crate::raw).
 ///
 /// # Example
 ///
