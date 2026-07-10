@@ -159,7 +159,7 @@ impl Default for ConnectionOptions {
     /// Defaults:
     /// - `autoconnect`: `true`
     /// - `autoconnect_priority`: `None` (uses NetworkManager's default of 0)
-    /// - `autoconnect_retries`: `None` (unlimited retries)
+    /// - `autoconnect_retries`: `None` (uses NetworkManager's global default configuration of 4 retries)
     fn default() -> Self {
         Self {
             autoconnect: true,
