@@ -412,4 +412,67 @@ mod tests {
         let ssid = wireless.get("ssid").unwrap();
         assert_eq!(ssid, &Value::from("Café-Wïfì_123".as_bytes().to_vec()));
     }
+
+    #[test]
+    fn connection_with_negative_priority_and_zero_retries() {
+        let opts = ConnectionOptions {
+            autoconnect: true,
+            autoconnect_priority: Some(-5),
+            autoconnect_retries: Some(0), // 0 means try indefinitely in NM
+        };
+
+        let conn = build_wifi_connection("fallback_net", &WifiSecurity::Open, &opts);
+        let connection_section = conn.get("connection").unwrap();
+
+        assert_eq!(
+            connection_section.get("autoconnect-priority"),
+            Some(&Value::from(-5i32))
+        );
+        assert_eq!(
+            connection_section.get("autoconnect-retries"),
+            Some(&Value::from(0i32))
+        );
+    }
+
+    #[test]
+    fn connection_with_max_valid_boundaries() {
+        let opts = ConnectionOptions {
+            autoconnect: true,
+            autoconnect_priority: Some(999),     // NM max priority
+            autoconnect_retries: Some(i32::MAX), // NM max retries
+        };
+
+        let conn = build_wifi_connection("max_boundaries_net", &WifiSecurity::Open, &opts);
+        let connection_section = conn.get("connection").unwrap();
+
+        assert_eq!(
+            connection_section.get("autoconnect-priority"),
+            Some(&Value::from(999i32))
+        );
+        assert_eq!(
+            connection_section.get("autoconnect-retries"),
+            Some(&Value::from(i32::MAX))
+        );
+    }
+
+    #[test]
+    fn connection_with_min_valid_boundaries() {
+        let opts = ConnectionOptions {
+            autoconnect: true,
+            autoconnect_priority: Some(-999), // NM min priority
+            autoconnect_retries: Some(-1),    // NM default retries
+        };
+
+        let conn = build_wifi_connection("min_boundaries_net", &WifiSecurity::Open, &opts);
+        let connection_section = conn.get("connection").unwrap();
+
+        assert_eq!(
+            connection_section.get("autoconnect-priority"),
+            Some(&Value::from(-999i32))
+        );
+        assert_eq!(
+            connection_section.get("autoconnect-retries"),
+            Some(&Value::from(-1i32))
+        );
+    }
 }
