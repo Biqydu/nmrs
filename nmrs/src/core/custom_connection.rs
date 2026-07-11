@@ -82,20 +82,33 @@ async fn resolve_device_path(
     }
 }
 
-fn bluetooth_bdaddr_from_settings(
+fn bluetooth_settings_from_settings(
     settings: &HashMap<&str, HashMap<&str, Value<'_>>>,
-) -> Result<String> {
-    settings
+) -> Result<(String, Option<String>)> {
+    let section = settings
         .get("bluetooth")
-        .and_then(|section| section.get("bdaddr"))
-        .and_then(|value| match value {
-            Value::Str(bdaddr) => Some(bdaddr.as_str().to_string()),
+        .ok_or_else(|| ConnectionError::InvalidInput {
+            field: "bluetooth".into(),
+            reason: "missing bluetooth section".into(),
+        })?;
+
+    let bdaddr = section
+        .get("bdaddr")
+        .and_then(|v| match v {
+            Value::Str(s) => Some(s.to_string()),
             _ => None,
         })
         .ok_or_else(|| ConnectionError::InvalidInput {
             field: "bluetooth.bdaddr".into(),
-            reason: "bluetooth settings are missing bdaddr".into(),
-        })
+            reason: "missing bdaddr".into(),
+        })?;
+
+    let adapter = section.get("adapter").and_then(|v| match v {
+        Value::Str(s) => Some(s.to_string()),
+        _ => None,
+    });
+
+    Ok((bdaddr, adapter))
 }
 
 fn resolve_specific_object(
@@ -110,13 +123,13 @@ fn resolve_specific_object(
     }
 
     if connection_type_from_settings(settings)? == "bluetooth" {
-        let bdaddr = bluetooth_bdaddr_from_settings(settings)?;
-        return OwnedObjectPath::try_from(bluez_device_path(&bdaddr, None)).map_err(|e| {
-            ConnectionError::InvalidInput {
+        let (bdaddr, adapter) = bluetooth_settings_from_settings(settings)?;
+        return OwnedObjectPath::try_from(bluez_device_path(&bdaddr, adapter.as_deref())).map_err(
+            |e| ConnectionError::InvalidInput {
                 field: "specific_object".into(),
                 reason: e.to_string(),
-            }
-        });
+            },
+        );
     }
 
     Ok(OwnedObjectPath::default())
@@ -220,5 +233,70 @@ mod tests {
             resolve_specific_object(&settings, Some("/org/freedesktop/NetworkManager/Devices/3"))
                 .unwrap();
         assert_eq!(path.as_str(), "/org/freedesktop/NetworkManager/Devices/3");
+    }
+
+    #[test]
+    fn bluetooth_settings_from_settings_extracts_bdaddr_and_adapter() {
+        let mut bluetooth = HashMap::new();
+        bluetooth.insert("bdaddr", Value::from("00:11:22:33:44:55"));
+        bluetooth.insert("adapter", Value::from("hci1"));
+
+        let mut settings = HashMap::new();
+        settings.insert("bluetooth", bluetooth);
+
+        let (bdaddr, adapter) = bluetooth_settings_from_settings(&settings).unwrap();
+
+        assert_eq!(bdaddr, "00:11:22:33:44:55");
+        assert_eq!(adapter, Some("hci1".to_string()));
+    }
+
+    #[test]
+    fn bluetooth_settings_from_settings_requires_bluetooth_section() {
+        let settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
+
+        let err = bluetooth_settings_from_settings(&settings).unwrap_err();
+        assert!(matches!(err, ConnectionError::InvalidInput { field, .. } if field == "bluetooth"));
+    }
+
+    #[test]
+    fn bluetooth_settings_from_settings_requires_bdaddr() {
+        let mut bluetooth = HashMap::new();
+        bluetooth.insert("adapter", Value::from("hci0"));
+
+        let mut settings = HashMap::new();
+        settings.insert("bluetooth", bluetooth);
+
+        let err = bluetooth_settings_from_settings(&settings).unwrap_err();
+        assert!(
+            matches!(err, ConnectionError::InvalidInput { field, .. } if field == "bluetooth.bdaddr")
+        );
+    }
+
+    #[test]
+    fn bluetooth_settings_from_settings_works_without_adapter() {
+        let mut bluetooth = HashMap::new();
+        bluetooth.insert("bdaddr", Value::from("AA:BB:CC:DD:EE:FF"));
+
+        let mut settings = HashMap::new();
+        settings.insert("bluetooth", bluetooth);
+
+        let (bdaddr, adapter) = bluetooth_settings_from_settings(&settings).unwrap();
+
+        assert_eq!(bdaddr, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(adapter, None);
+    }
+
+    #[test]
+    fn bluetooth_settings_from_settings_handles_wrong_value_types() {
+        let mut bluetooth = HashMap::new();
+        bluetooth.insert("bdaddr", Value::from(12345u32));
+
+        let mut settings = HashMap::new();
+        settings.insert("bluetooth", bluetooth);
+
+        let err = bluetooth_settings_from_settings(&settings).unwrap_err();
+        assert!(
+            matches!(err, ConnectionError::InvalidInput { field, .. } if field == "bluetooth.bdaddr")
+        );
     }
 }
