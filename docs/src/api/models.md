@@ -186,7 +186,7 @@ let saved_vpns = snapshot.saved_vpn_map();
 let applet = snapshot.applet_summary();
 ```
 
-`wifi_groups()` groups access points by `(interface, ssid)`, keeps every BSSID,
+`wifi_groups()` groups visible access points by `(interface, ssid)`, keeps every BSSID,
 marks known networks from matching saved profiles, and marks the active group
 from typed active Wi-Fi connections.
 
