@@ -74,11 +74,11 @@ impl NetworkSnapshot {
     pub fn wifi_groups(&self) -> Vec<WifiNetworkGroup> {
         let mut grouped: HashMap<(String, String), Vec<AccessPoint>> = HashMap::new();
         for ap in &self.access_points {
-            if &ap.ssid != "" {
-            grouped
-                .entry((ap.interface.clone(), ap.ssid.clone()))
-                .or_default()
-                .push(ap.clone());
+            if !ap.ssid.is_empty() {
+                grouped
+                    .entry((ap.interface.clone(), ap.ssid.clone()))
+                    .or_default()
+                    .push(ap.clone());
             }
         }
 
